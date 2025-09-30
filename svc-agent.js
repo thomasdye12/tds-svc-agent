@@ -1,19 +1,25 @@
 #!/usr/bin/env node
 /**
- * TDS Service Health Agent
- * - Linux (systemd): enumerates with `systemctl`
- * - macOS (launchd): enumerates with `launchctl`
- * - HTTP API: /health, /services, /services/:id, /metrics
- * - Optional push to central collector
+ * TDS Service Health Agent — WebSocket edition (no inbound ports by default)
+ * Platforms:
+ *   - Linux (systemd): enumerates with `systemctl`
+ *   - macOS (launchd): enumerates with `launchctl`
+ * Features:
+ *   - Persistent outbound WebSocket to central server (two-way)
+ *   - Optional local HTTP endpoints (disabled by default)
+ *   - Stable systemId generation & persistence
+ *   - Optional Docker container enumeration
  */
+
 const os = require("os");
-const http = require("http");
-const crypto = require("crypto");
-const { exec } = require("child_process");
-const express = require("express");
-const prom = require("prom-client");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const { exec } = require("child_process");
+const WebSocket = require("ws"); // ensure dependency in package.json
+// HTTP/Prometheus are optional; required only if enabled
+let express = null;
+let prom = null;
 
 // ---------- Config ----------
 const CONFIG_PATHS = [
@@ -24,136 +30,62 @@ const CONFIG_PATHS = [
 ].filter(Boolean);
 
 const defaults = {
-  port: Number(process.env.PORT || 8088),
-  bind: process.env.BIND || "0.0.0.0",
-  include: [],
-  exclude: [],
-  push: {
-    enabled: process.env.PUSH_ENABLED === "true" || false,
-    url: process.env.CENTRAL_URL || "",
-    intervalSec: Number(process.env.PUSH_INTERVAL || 60),
-    token: process.env.AUTH_TOKEN || "",
+  // Optional local HTTP (disabled by default so nothing is exposed)
+  http: {
+    enabled: false,
+    port: Number(process.env.PORT || 8088),
+    bind: process.env.BIND || "127.0.0.1",
+    prometheus: true, // only effective if http.enabled = true
   },
+
+  include: [], // e.g. ["nginx.service"]
+  exclude: [], // e.g. ["snapd.service"]
+
+  // WebSocket to central
+  ws: {
+    url: process.env.CENTRAL_WS_URL || "", // e.g. "wss://collector.tds/agent"
+    token: process.env.AUTH_TOKEN || "",   // Bearer token
+    // TLS: set to true ONLY if you know what you’re doing
+    insecureSkipTlsVerify: process.env.WS_INSECURE === "true" || false,
+    heartbeatSec: Number(process.env.WS_HEARTBEAT || 25),
+    reconnectBaseMs: Number(process.env.WS_RECONNECT_BASE || 1000),
+    reconnectMaxMs: Number(process.env.WS_RECONNECT_MAX || 30000),
+  },
+
+  // Periodic snapshot push over WS
+  reporting: {
+    intervalSec: Number(process.env.REPORT_INTERVAL || 30),
+    sendOnConnect: true,
+  },
+
   docker: {
     enabled: process.env.DOCKER_ENABLED === "true" || false,
     binary: process.env.DOCKER_BIN || "docker",
   },
+
+  // Optional hard-override for systemId
+  systemId: undefined,
 };
 
 let config = { ...defaults };
 for (const p of CONFIG_PATHS) {
   try {
-    if (fs.existsSync(p)) {
+    if (p && fs.existsSync(p)) {
       const loaded = JSON.parse(fs.readFileSync(p, "utf8"));
       config = { ...config, ...loaded };
       console.log(`[svc-agent] Loaded config from ${p}`);
       break;
     }
   } catch (e) {
-    console.error("Config load error:", e.message);
+    console.error("[svc-agent] Config load error:", e.message);
   }
 }
 
 const HOSTNAME = os.hostname();
 
-// ---------- System ID (stable, unique per machine) ----------
-const ID_FILE_CANDIDATES = [
-    process.env.SVC_AGENT_ID_PATH || "",                 // explicit override
-    "/etc/tds-svc-agent.id",                             // system-wide (Linux)
-    path.join(process.cwd(), ".tds-svc-agent.id"),       // working dir
-    path.join(__dirname, ".tds-svc-agent.id"),           // alongside script
-  ].filter(Boolean);
-  
-  async function readFirstExisting(paths) {
-    for (const p of paths) {
-      try {
-        if (fs.existsSync(p)) return fs.readFileSync(p, "utf8").trim();
-      } catch (_) {}
-    }
-    return null;
-  }
-  
-  async function writeFirstWritable(paths, value) {
-    for (const p of paths) {
-      try {
-        fs.writeFileSync(p, value + "\n", { mode: 0o600 });
-        return p;
-      } catch (_) {}
-    }
-    return null;
-  }
-  
-  async function getLinuxMachineId() {
-    try {
-      const a = "/etc/machine-id";
-      const b = "/var/lib/dbus/machine-id";
-      if (fs.existsSync(a)) return fs.readFileSync(a, "utf8").trim();
-      if (fs.existsSync(b)) return fs.readFileSync(b, "utf8").trim();
-    } catch (_) {}
-    return null;
-  }
-  
-  async function getMacPlatformUUID() {
-    try {
-      const { stdout } = await execCmd(
-        `/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ {print $4}'`
-      );
-      const v = stdout.trim();
-      return v || null;
-    } catch (_) {
-      return null;
-    }
-  }
-  
-  async function initSystemId() {
-    // 1) Config override
-    if (config.systemId) return String(config.systemId).trim();
-  
-    // 2) Previously persisted file (any location)
-    const persisted = await readFirstExisting(ID_FILE_CANDIDATES);
-    if (persisted) return persisted;
-  
-    // 3) OS-native IDs
-    let osId = null;
-    if (process.platform === "linux") osId = await getLinuxMachineId();
-    else if (process.platform === "darwin") osId = await getMacPlatformUUID();
-  
-    // 4) Fallback: hash of hostname + MACs (stable if NICs stable)
-    if (!osId) {
-      try {
-        const ifaces = os.networkInterfaces();
-        const macs = Object.values(ifaces)
-          .flat()
-          .filter(Boolean)
-          .map((i) => i.mac)
-          .filter((m) => m && m !== "00:00:00:00:00:00")
-          .sort()
-          .join(",");
-        const hash = crypto
-          .createHash("sha256")
-          .update(`${HOSTNAME}|${macs}`)
-          .digest("hex")
-          .slice(0, 32);
-        osId = `sha256-${hash}`;
-      } catch {
-        osId = null;
-      }
-    }
-  
-    // 5) Absolute fallback: random UUIDv4
-    if (!osId) osId = crypto.randomUUID();
-  
-    // Persist for stability
-    await writeFirstWritable(ID_FILE_CANDIDATES, osId);
-    return osId;
-  }
 // ---------- Helpers ----------
-const slug = (s) =>
-  s.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-
-const mkId = (serviceName) => `${slug(HOSTNAME)}:${slug(serviceName)}`; // keep existing behavior
-let SYSTEM_ID = "unknown"; // will be initialized below
-const mkGlobalId = (serviceName) => `${SYSTEM_ID}:${slug(serviceName)}`; // globally unique service id
+const isLinux = process.platform === "linux";
+const isMac = process.platform === "darwin";
 
 function execCmd(cmd) {
   return new Promise((resolve) => {
@@ -163,13 +95,100 @@ function execCmd(cmd) {
   });
 }
 
+const slug = (s) =>
+  String(s).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 
-const isLinux = process.platform === "linux";
-const isMac = process.platform === "darwin";
+const mkId = (serviceName) => `${slug(HOSTNAME)}:${slug(serviceName)}`;
+let SYSTEM_ID = "unknown";
+const mkGlobalId = (serviceName) => `${SYSTEM_ID}:${slug(serviceName)}`;
+
+// ---------- System ID (stable, unique per machine) ----------
+const ID_FILE_CANDIDATES = [
+  process.env.SVC_AGENT_ID_PATH || "",           // explicit override path
+  "/etc/tds-svc-agent.id",                       // system-wide (Linux)
+  path.join(process.cwd(), ".tds-svc-agent.id"), // working dir
+  path.join(__dirname, ".tds-svc-agent.id"),     // alongside script
+].filter(Boolean);
+
+async function readFirstExisting(paths) {
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p)) return fs.readFileSync(p, "utf8").trim();
+    } catch (_) {}
+  }
+  return null;
+}
+
+async function writeFirstWritable(paths, value) {
+  for (const p of paths) {
+    try {
+      fs.writeFileSync(p, value + "\n", { mode: 0o600 });
+      return p;
+    } catch (_) {}
+  }
+  return null;
+}
+
+async function getLinuxMachineId() {
+  try {
+    const a = "/etc/machine-id";
+    const b = "/var/lib/dbus/machine-id";
+    if (fs.existsSync(a)) return fs.readFileSync(a, "utf8").trim();
+    if (fs.existsSync(b)) return fs.readFileSync(b, "utf8").trim();
+  } catch (_) {}
+  return null;
+}
+
+async function getMacPlatformUUID() {
+  try {
+    const { stdout } = await execCmd(
+      `/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ {print $4}'`
+    );
+    const v = stdout.trim();
+    return v || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function initSystemId() {
+  if (config.systemId) return String(config.systemId).trim();
+
+  const persisted = await readFirstExisting(ID_FILE_CANDIDATES);
+  if (persisted) return persisted;
+
+  let osId = null;
+  if (isLinux) osId = await getLinuxMachineId();
+  else if (isMac) osId = await getMacPlatformUUID();
+
+  if (!osId) {
+    try {
+      const ifaces = os.networkInterfaces();
+      const macs = Object.values(ifaces)
+        .flat()
+        .filter(Boolean)
+        .map((i) => i.mac)
+        .filter((m) => m && m !== "00:00:00:00:00:00")
+        .sort()
+        .join(",");
+      const hash = crypto
+        .createHash("sha256")
+        .update(`${HOSTNAME}|${macs}`)
+        .digest("hex")
+        .slice(0, 32);
+      osId = `sha256-${hash}`;
+    } catch {
+      osId = null;
+    }
+  }
+
+  if (!osId) osId = crypto.randomUUID();
+  await writeFirstWritable(ID_FILE_CANDIDATES, osId);
+  return osId;
+}
 
 // ---------- Enumerators ----------
 async function listSystemdServices() {
-  // Robust: use `systemctl show` to get key=val; avoid column parsing.
   const cmd =
     "systemctl show --type=service --all --no-page --property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,FragmentPath";
   const { stdout } = await execCmd(cmd);
@@ -189,25 +208,25 @@ async function listSystemdServices() {
     }
     if (!obj.Id || !obj.Id.endsWith(".service")) continue;
 
-    // filters
     if (config.include.length && !config.include.includes(obj.Id)) continue;
     if (config.exclude.includes(obj.Id)) continue;
 
     const name = obj.Id;
-    const id = mkId(name);
     services.push({
-      id,
+      id: mkId(name),
+      gid: mkGlobalId(name),
+      systemId: SYSTEM_ID,
       host: HOSTNAME,
       service: name,
-      systemId: SYSTEM_ID,
       description: obj.Description || "",
       load: obj.LoadState || "unknown",
       active: obj.ActiveState || "unknown",
       sub: obj.SubState || "unknown",
       unitFileState: obj.UnitFileState || "unknown",
       path: obj.FragmentPath || "",
-      // convenience derived field
-      healthy: (obj.ActiveState === "active" && obj.SubState === "running") || obj.ActiveState === "active",
+      healthy:
+        (obj.ActiveState === "active" && obj.SubState === "running") ||
+        obj.ActiveState === "active",
       updatedAt: new Date().toISOString(),
       platform: "linux",
     });
@@ -216,17 +235,13 @@ async function listSystemdServices() {
 }
 
 async function listLaunchdServices() {
-  // Note: `launchctl list` returns lines: PID\tStatus\tLabel
-  // Status 0 means OK; PID may be "-" for not running.
-  // This enumerates user space. System space typically needs sudo (`launchctl print system` parsing is messy).
   const { stdout } = await execCmd("launchctl list || true");
-  const lines = stdout.split("\n").slice(1); // skip header if present
+  const lines = stdout.split("\n").slice(1);
   const services = [];
 
   for (const line of lines) {
     if (!line.trim()) continue;
     const parts = line.trim().split(/\s+/);
-    // Try to parse: PID, Status, Label
     const label = parts[parts.length - 1];
     if (!label) continue;
 
@@ -236,15 +251,15 @@ async function listLaunchdServices() {
     const statusNum = Number(statusRaw);
     const healthy = running && (isNaN(statusNum) || statusNum === 0);
 
-    // filters
     if (config.include.length && !config.include.includes(label)) continue;
     if (config.exclude.includes(label)) continue;
 
     services.push({
-      id: mkId(`${label}`),
+      id: mkId(label),
+      gid: mkGlobalId(label),
+      systemId: SYSTEM_ID,
       host: HOSTNAME,
       service: label,
-      systemId: SYSTEM_ID,
       description: "",
       load: running ? "loaded" : "not-loaded",
       active: running ? "active" : "inactive",
@@ -261,25 +276,26 @@ async function listLaunchdServices() {
 
 async function listDockerContainers() {
   if (!config.docker.enabled) return [];
-  const { stdout, err } = await execCmd(
+  const { stdout } = await execCmd(
     `${config.docker.binary} ps --format "{{.ID}}|{{.Names}}|{{.Status}}"`
   );
-  if (err) return [];
   const lines = stdout.trim().split("\n").filter(Boolean);
   return lines.map((l) => {
     const [id, name, status] = l.split("|");
+    const up = /Up\s/i.test(status);
     return {
       id: mkId(`docker:${name}`),
-      host: HOSTNAME,
+      gid: mkGlobalId(`docker:${name}`),
       systemId: SYSTEM_ID,
+      host: HOSTNAME,
       service: `docker:${name}`,
       description: `Container ${id}`,
       load: "loaded",
-      active: /Up\s/i.test(status) ? "active" : "inactive",
+      active: up ? "active" : "inactive",
       sub: status,
       unitFileState: "container",
       path: "",
-      healthy: /Up\s/i.test(status),
+      healthy: up,
       updatedAt: new Date().toISOString(),
       platform: "docker",
     };
@@ -302,74 +318,208 @@ async function takeSnapshot() {
   return lastSnapshot;
 }
 
-// ---------- Push to central ----------
-async function pushSnapshot() {
-  if (!config.push.enabled || !config.push.url) return;
-  const payload = {
-    host: HOSTNAME,
-    systemId: SYSTEM_ID,
-    takenAt: lastSnapshot.takenAt || new Date().toISOString(),
-    services: lastSnapshot.services,
-    agent: {
-      version: "1.0.0",
-      platform: process.platform,
-      node: process.version,
-    },
-  };
+// ---------- WS Client (two-way) ----------
+let ws = null;
+let wsTimerHeartbeat = null;
+let wsTimerReconnect = null;
+let lastPongAt = 0;
+let reconnectAttempts = 0;
 
-  const data = Buffer.from(JSON.stringify(payload));
-  const u = new URL(config.push.url);
+function wsLog(...args) {
+  console.log("[ws]", ...args);
+}
 
-  const opts = {
-    hostname: u.hostname,
-    port: u.port || (u.protocol === "https:" ? 443 : 80),
-    path: u.pathname + (u.search || ""),
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "content-length": data.length,
-    },
-  };
-// console.log("[svc-agent] Pushing snapshot to", JSON.stringify(opts));
-  if (config.push.token) {
-    opts.headers.authorization = `Bearer ${config.push.token}`;
+function wsSend(obj) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  } catch (_) {}
+}
+
+function scheduleReconnect() {
+  if (wsTimerReconnect) return;
+  const base = Math.max(100, config.ws.reconnectBaseMs || 1000);
+  const max = Math.max(base, config.ws.reconnectMaxMs || 30000);
+  const jitter = Math.floor(Math.random() * 200);
+  const backoff = Math.min(max, Math.floor(base * Math.pow(2, reconnectAttempts)));
+  const delay = backoff + jitter;
+  wsLog(`reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`);
+  wsTimerReconnect = setTimeout(() => {
+    wsTimerReconnect = null;
+    connectWS();
+  }, delay);
+}
+
+async function handleMessage(msg) {
+  let data = null;
+  try {
+    data = JSON.parse(msg);
+  } catch {
+    return;
+  }
+  const { type, id } = data || {};
+
+  switch (type) {
+    case "ping":
+      wsSend({ type: "pong", ts: Date.now() });
+      return;
+
+    case "getSnapshot": {
+      const snap = await takeSnapshot();
+      wsSend({
+        type: "snapshot",
+        id, // echo request id if provided
+        systemId: SYSTEM_ID,
+        host: HOSTNAME,
+        takenAt: snap.takenAt,
+        services: snap.services,
+        agent: {
+          version: "2.0.0-ws",
+          platform: process.platform,
+          node: process.version,
+        },
+      });
+      return;
+    }
+
+    case "refresh": {
+      const snap = await takeSnapshot();
+      wsSend({ type: "ok", id, takenAt: snap.takenAt, count: snap.services.length });
+      // Optionally also stream the snapshot back:
+      wsSend({
+        type: "snapshot",
+        systemId: SYSTEM_ID,
+        host: HOSTNAME,
+        takenAt: snap.takenAt,
+        services: snap.services,
+        agent: {
+          version: "2.0.0-ws",
+          platform: process.platform,
+          node: process.version,
+        },
+      });
+      return;
+    }
+
+    default:
+      // unknown / ignored
+      return;
+  }
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  const interval = Math.max(5, config.ws.heartbeatSec || 25) * 1000;
+  wsTimerHeartbeat = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Use WebSocket-level ping frame; ws will auto emit 'pong'
+    try {
+      ws.ping();
+    } catch (_) {}
+    // Detect stale
+    const now = Date.now();
+    if (lastPongAt && now - lastPongAt > interval * 2) {
+      wsLog("heartbeat timeout; closing socket");
+      try { ws.terminate(); } catch (_) {}
+    }
+  }, Math.floor((config.ws.heartbeatSec || 25) * 1000));
+}
+
+function stopHeartbeat() {
+  if (wsTimerHeartbeat) {
+    clearInterval(wsTimerHeartbeat);
+    wsTimerHeartbeat = null;
+  }
+}
+
+function connectWS() {
+  if (!config.ws.url) {
+    console.error("[svc-agent] No ws.url configured; cannot connect.");
+    return;
   }
 
-  const useHttps = u.protocol === "https:";
-  const client = useHttps ? require("https") : require("http");
+  const headers = {};
+  if (config.ws.token) headers["authorization"] = `Bearer ${config.ws.token}`;
 
-  await new Promise((resolve) => {
-    const req = client.request(opts, (res) => {
-      // Drain
-      res.on("data", () => {});
-      res.on("end", resolve);
+  const url = new URL(config.ws.url);
+  // Add identity hints in query (server can cross-check against headers)
+  url.searchParams.set("systemId", SYSTEM_ID);
+  url.searchParams.set("host", HOSTNAME);
+
+  const wsOptions = {
+    headers,
+    perMessageDeflate: true,
+    rejectUnauthorized: !config.ws.insecureSkipTlsVerify,
+  };
+
+  ws = new WebSocket(url.toString(), wsOptions);
+
+  ws.on("open", async () => {
+    reconnectAttempts = 0;
+    lastPongAt = Date.now();
+    wsLog("connected");
+    startHeartbeat();
+
+    // Say hello
+    wsSend({
+      type: "hello",
+      systemId: SYSTEM_ID,
+      host: HOSTNAME,
+      caps: {
+        docker: !!config.docker.enabled,
+        http: !!config.http.enabled,
+        platform: process.platform,
+      },
+      agent: { version: "2.0.0-ws", node: process.version },
+      ts: Date.now(),
     });
-    req.on("error", resolve);
-    req.write(data);
-    req.end();
+
+    if (config.reporting.sendOnConnect) {
+      const snap = await takeSnapshot();
+      wsSend({
+        type: "snapshot",
+        systemId: SYSTEM_ID,
+        host: HOSTNAME,
+        takenAt: snap.takenAt,
+        services: snap.services,
+        agent: { version: "2.0.0-ws", platform: process.platform, node: process.version },
+      });
+    }
+  });
+
+  ws.on("message", (data) => {
+    try {
+      handleMessage(data.toString());
+    } catch (e) {
+      wsLog("message error", e.message);
+    }
+  });
+
+  ws.on("pong", () => {
+    lastPongAt = Date.now();
+  });
+
+  ws.on("close", (code, reason) => {
+    stopHeartbeat();
+    wsLog(`closed (${code}) ${reason ? reason.toString() : ""}`);
+    reconnectAttempts++;
+    scheduleReconnect();
+  });
+
+  ws.on("error", (err) => {
+    wsLog("error:", err.message);
+    // socket will close, reconnect will schedule in 'close'
   });
 }
 
-// ---------- HTTP API ----------
-const app = express();
-app.use(express.json());
-
-const collectDefaultMetrics = prom.collectDefaultMetrics;
-collectDefaultMetrics();
-
-const gaugeServiceHealthy = new prom.Gauge({
-  name: "tds_service_healthy",
-  help: "1 if the service is healthy, else 0",
-  labelNames: ["host", "service", "platform"],
-});
-
-const gaugeServicesCount = new prom.Gauge({
-  name: "tds_services_count",
-  help: "Number of services reported",
-  labelNames: ["host"],
-});
+// ---------- Optional local HTTP (disabled by default) ----------
+let httpServer = null;
+let gaugeServiceHealthy = null;
+let gaugeServicesCount = null;
 
 function updateMetrics(snapshot) {
+  if (!prom || !gaugeServiceHealthy || !gaugeServicesCount) return;
   gaugeServicesCount.set({ host: HOSTNAME }, snapshot.services.length);
   snapshot.services.forEach((s) => {
     gaugeServiceHealthy.set(
@@ -379,82 +529,109 @@ function updateMetrics(snapshot) {
   });
 }
 
-// Basic healthcheck
-app.get("/health", async (_req, res) => {
-  if (!lastSnapshot.takenAt) await takeSnapshot();
-  res.json({
-    ok: true,
-    host: HOSTNAME,
-    systemId: SYSTEM_ID,
-    takenAt: lastSnapshot.takenAt,
-    servicesCount: lastSnapshot.services.length,
-    agent: {
-      version: "1.0.0",
-      platform: process.platform,
-      node: process.version,
-    },
+async function maybeStartHttp() {
+  if (!config.http || !config.http.enabled) return;
+
+  express = require("express");
+  prom = require("prom-client");
+
+  const app = express();
+  app.use(express.json());
+
+  const collectDefaultMetrics = prom.collectDefaultMetrics;
+  collectDefaultMetrics();
+
+  gaugeServiceHealthy = new prom.Gauge({
+    name: "tds_service_healthy",
+    help: "1 if the service is healthy, else 0",
+    labelNames: ["host", "service", "platform"],
   });
-});
 
-// Full services list
-app.get("/services", async (_req, res) => {
-  if (!lastSnapshot.takenAt) await takeSnapshot();
-  res.json(lastSnapshot);
-});
+  gaugeServicesCount = new prom.Gauge({
+    name: "tds_services_count",
+    help: "Number of services reported",
+    labelNames: ["host"],
+  });
 
-// Single service by id (hostname:service)
-app.get("/services/:id", async (req, res) => {
-  if (!lastSnapshot.takenAt) await takeSnapshot();
-  const svc = lastSnapshot.services.find((s) => s.id === req.params.id);
-  if (!svc) return res.status(404).json({ error: "not found" });
-  res.json(svc);
-});
-
-// Force refresh now
-app.post("/refresh", async (_req, res) => {
-  const snap = await takeSnapshot();
-  updateMetrics(snap);
-  res.json({ ok: true, takenAt: snap.takenAt, services: snap.services.length });
-});
-
-// Prometheus metrics
-app.get("/metrics", async (_req, res) => {
-  res.set("Content-Type", prom.register.contentType);
-  res.end(await prom.register.metrics());
-});
-
-(async function boot() {
-    SYSTEM_ID = await initSystemId();
-  
-    const server = app.listen(config.port, config.bind, async () => {
-      const first = await takeSnapshot();
-      updateMetrics(first);
-      // optional initial push
-      pushSnapshot().catch(() => {});
-      console.log(
-        `[svc-agent] ${HOSTNAME} (${SYSTEM_ID}) on http://${config.bind}:${config.port} — ${first.services.length} services`
-      );
+  // Minimal safe endpoints (local by default)
+  app.get("/health", async (_req, res) => {
+    if (!lastSnapshot.takenAt) await takeSnapshot();
+    res.json({
+      ok: true,
+      host: HOSTNAME,
+      systemId: SYSTEM_ID,
+      takenAt: lastSnapshot.takenAt,
+      servicesCount: lastSnapshot.services.length,
+      agent: { version: "2.0.0-ws", platform: process.platform, node: process.version },
     });
-  
-    // periodic refresh + push (unchanged)
-    const REFRESH_MS = 30 * 1000;
-    setInterval(async () => {
-      const snap = await takeSnapshot();
-      updateMetrics(snap);
-      if (config.push.enabled) pushSnapshot().catch(() => {});
-    }, REFRESH_MS);
-  
-    // graceful shutdown (unchanged)
-    function shutdown(sig) {
-      console.log(`[svc-agent] ${sig} received, shutting down`);
-      server.close(() => process.exit(0));
-    }
-    ["SIGINT", "SIGTERM"].forEach((sig) => process.on(sig, () => shutdown(sig)));
-  })();
+  });
 
-// Graceful shutdown
-function shutdown(sig) {
+  app.get("/services", async (_req, res) => {
+    if (!lastSnapshot.takenAt) await takeSnapshot();
+    res.json(lastSnapshot);
+  });
+
+  app.post("/refresh", async (_req, res) => {
+    const snap = await takeSnapshot();
+    updateMetrics(snap);
+    res.json({ ok: true, takenAt: snap.takenAt, services: snap.services.length });
+  });
+
+  if (config.http.prometheus) {
+    app.get("/metrics", async (_req, res) => {
+      res.set("Content-Type", prom.register.contentType);
+      res.end(await prom.register.metrics());
+    });
+  }
+
+  await new Promise((resolve) => {
+    httpServer = app.listen(config.http.port, config.http.bind, resolve);
+  });
+  console.log(
+    `[svc-agent] HTTP ${config.http.bind}:${config.http.port} (enabled=${config.http.enabled})`
+  );
+}
+
+// ---------- Periodic reporting ----------
+let timerReport = null;
+function startPeriodicReports() {
+  const ms = Math.max(5, config.reporting.intervalSec || 30) * 1000;
+  stopPeriodicReports();
+  timerReport = setInterval(async () => {
+    const snap = await takeSnapshot();
+    updateMetrics(snap);
+    wsSend({
+      type: "snapshot",
+      systemId: SYSTEM_ID,
+      host: HOSTNAME,
+      takenAt: snap.takenAt,
+      services: snap.services,
+      agent: { version: "2.0.0-ws", platform: process.platform, node: process.version },
+    });
+  }, ms);
+}
+function stopPeriodicReports() {
+  if (timerReport) clearInterval(timerReport);
+  timerReport = null;
+}
+
+// ---------- Boot ----------
+(async function boot() {
+  SYSTEM_ID = await initSystemId();
+  console.log(`[svc-agent] host=${HOSTNAME} systemId=${SYSTEM_ID}`);
+
+  await takeSnapshot(); // prime
+  await maybeStartHttp();
+  connectWS();
+  startPeriodicReports();
+
+  function shutdown(sig) {
     console.log(`[svc-agent] ${sig} received, shutting down`);
-    server.close(() => process.exit(0));
+    stopHeartbeat();
+    stopPeriodicReports();
+    try { ws && ws.close(); } catch (_) {}
+    try { httpServer && httpServer.close(); } catch (_) {}
+    setTimeout(() => process.exit(0), 300);
   }
   ["SIGINT", "SIGTERM"].forEach((sig) => process.on(sig, () => shutdown(sig)));
+})();

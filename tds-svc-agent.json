@@ -1,16 +1,26 @@
-{
-    "port": 5668,
-    "bind": "127.0.0.1",
-    "include": [],
-    "exclude": ["snapd.service"],
-    "push": {
-      "enabled": true,
-      "url": "http://collector.local.thomasdye.net:5669/ingest",
-      "intervalSec": 60,
-      "token": "REDACTED_BEARER"
+  {
+    "http": {
+      "enabled": false,
+      "port": 5668,
+      "bind": "127.0.0.1",
+      "prometheus": true
+    },
+    "ws": {
+      "url": "wss://collector.local.thomasdye.net:5669/agent",
+      "token": "REDACTED_BEARER",
+      "insecureSkipTlsVerify": false,
+      "heartbeatSec": 25,
+      "reconnectBaseMs": 1000,
+      "reconnectMaxMs": 30000
+    },
+    "reporting": {
+      "intervalSec": 30,
+      "sendOnConnect": true
     },
     "docker": {
-      "enabled": true
-    }
+      "enabled": true,
+      "binary": "docker"
+    },
+    "include": [],
+    "exclude": ["snapd.service"]
   }
-  
