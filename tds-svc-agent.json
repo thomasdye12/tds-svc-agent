@@ -8,7 +8,7 @@
     "ws": {
       "url": "wss://collector.local.thomasdye.net:5669/agent",
       "token": "REDACTED_BEARER",
-      "insecureSkipTlsVerify": false,
+      "insecureSkipTlsVerify": true,
       "heartbeatSec": 25,
       "reconnectBaseMs": 1000,
       "reconnectMaxMs": 30000
