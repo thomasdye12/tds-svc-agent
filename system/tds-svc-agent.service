@@ -1,0 +1,19 @@
+[Unit]
+Description=TDS Service Health Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/tds-svc-agent/svc-agent.js
+WorkingDirectory=/opt/tds-svc-agent
+Environment=NODE_ENV=production
+# Optional: point agent to system config
+# Environment=SVC_AGENT_CONFIG=/etc/tds-svc-agent.json
+Restart=always
+RestartSec=2
+User=nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target

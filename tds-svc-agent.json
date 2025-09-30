@@ -1,0 +1,16 @@
+{
+    "port": 5668,
+    "bind": "127.0.0.1",
+    "include": [],
+    "exclude": ["snapd.service"],
+    "push": {
+      "enabled": true,
+      "url": "http://collector.local.thomasdye.net:5669/ingest",
+      "intervalSec": 60,
+      "token": "REDACTED_BEARER"
+    },
+    "docker": {
+      "enabled": true
+    }
+  }
+  
