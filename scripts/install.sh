@@ -86,7 +86,7 @@ fetch_repo_zip() {
     ZIP_URL="https://codeload.github.com/${OWNER}/${REPO}/zip/refs/tags/${VERSION}"
   fi
 
-  echo "[*] Downloading ${ZIP_URL}"
+  # echo "[*] Downloading ${ZIP_URL}"
   download "$ZIP_URL" "$z" || err "Failed to download repo zip."
 
   local tmpdir
