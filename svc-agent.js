@@ -90,7 +90,12 @@ const isMac = process.platform === "darwin";
 function execCmd(cmd) {
   return new Promise((resolve) => {
     exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ err, stdout, stderr, code: err?.code ?? 0 });
+        resolve({
+            err,
+            stdout,
+            stderr,
+            code: (err && typeof err.code !== "undefined") ? err.code : 0
+          });
     });
   });
 }
