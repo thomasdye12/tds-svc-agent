@@ -102,15 +102,33 @@ const mkId = (serviceName) => `${slug(HOSTNAME)}:${slug(serviceName)}`;
 let SYSTEM_ID = "unknown";
 const mkGlobalId = (serviceName) => `${SYSTEM_ID}:${slug(serviceName)}`;
 
-async function runLocalInstallSh(extraArgs = []) {
+async function runLocalInstallSh(extraArgs = [], extraEnv = {}) {
     const installSh = path.join(__dirname, "scripts", "install.sh");
     if (!fs.existsSync(installSh)) throw new Error(`install.sh not found at ${installSh}`);
     try { fs.chmodSync(installSh, 0o755); } catch (_) {}
-    const cmd = `"${installSh}" ${extraArgs.map(a => `"${a}"`).join(" ")}`;
-    const { code, stdout, stderr } = await execCmd(cmd);
-    if (code !== 0) throw new Error(`install.sh failed (code ${code}): ${stderr || stdout || ""}`.trim());
-    return { code, stdout: stdout?.slice(-4000) || "" }; // trim noise
+  
+    const cmd = `"${installSh}" ${extraArgs.map(a => `"${a}"`).join(" ")}`.trim();
+    return new Promise((resolve, reject) => {
+      const child = require("child_process").spawn(cmd, {
+        shell: true,
+        env: { ...process.env, ...extraEnv },   // <— merge in env from WS
+        cwd: __dirname,
+      });
+  
+      let out = "", err = "";
+      child.stdout.on("data", d => { out += d.toString(); });
+      child.stderr.on("data", d => { err += d.toString(); });
+  
+      child.on("close", code => {
+        if (code !== 0) {
+          reject(new Error(`install.sh failed (code ${code}): ${err || out || code}`.trim()));
+        } else {
+          resolve({ code, stdout: (out || "").slice(-4000) });
+        }
+      });
+    });
   }
+  
   async function restartSelf() {
     // systemd if available
     if (isLinux && fs.existsSync("/run/systemd/system")) {
@@ -444,18 +462,13 @@ async function handleMessage(msg) {
     }
 
     case "runInstall": {
-        // payload supports: { type:"runInstall", id:"...", args?: string[], restart?: boolean }
         const args = Array.isArray(data.args) ? data.args : [];
         const restart = !!data.restart;
-      
+        const env = (data.env && typeof data.env === "object") ? data.env : {};
         try {
-          const res = await runLocalInstallSh(args);
+          const res = await runLocalInstallSh(args, env);
           wsSend({ type: "installResult", id, ok: true, stdout: res.stdout });
-      
-          if (restart) {
-            // give the socket a moment to flush
-            setTimeout(() => { restartSelf(); }, 500);
-          }
+          if (restart) setTimeout(() => { restartSelf(); }, 500);
         } catch (e) {
           wsSend({ type: "installResult", id, ok: false, error: e.message || String(e) });
         }
