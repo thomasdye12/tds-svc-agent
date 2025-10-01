@@ -1,3 +1,5 @@
 package-lock.json
 .tds-svc-agent.id
 node_modules
+.DS_store
+.DS_Store
