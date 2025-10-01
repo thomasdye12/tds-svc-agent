@@ -23,6 +23,8 @@ PORT_DEFAULT="${PORT_DEFAULT:-5668}"
 BIND_DEFAULT="${BIND_DEFAULT:-127.0.0.1}"
 CREATE_CONFIG="${CREATE_CONFIG:-true}"
 AUTO_NODE="${AUTO_NODE:-false}"
+: "${NODE_BIN:=}"
+: "${NPM_BIN:=}"
 
 need() { command -v "$1" >/dev/null 2>&1; }
 err() { echo "ERROR: $*" >&2; exit 1; }
