@@ -102,6 +102,47 @@ const mkId = (serviceName) => `${slug(HOSTNAME)}:${slug(serviceName)}`;
 let SYSTEM_ID = "unknown";
 const mkGlobalId = (serviceName) => `${SYSTEM_ID}:${slug(serviceName)}`;
 
+async function runLocalInstallSh(extraArgs = []) {
+    const installSh = path.join(__dirname, "scripts", "install.sh");
+    if (!fs.existsSync(installSh)) throw new Error(`install.sh not found at ${installSh}`);
+    try { fs.chmodSync(installSh, 0o755); } catch (_) {}
+    const cmd = `"${installSh}" ${extraArgs.map(a => `"${a}"`).join(" ")}`;
+    const { code, stdout, stderr } = await execCmd(cmd);
+    if (code !== 0) throw new Error(`install.sh failed (code ${code}): ${stderr || stdout || ""}`.trim());
+    return { code, stdout: stdout?.slice(-4000) || "" }; // trim noise
+  }
+  async function restartSelf() {
+    // systemd if available
+    if (isLinux && fs.existsSync("/run/systemd/system")) {
+      const unit = process.env.SVC_UNIT || "tds-svc-agent.service";
+      const r = await execCmd(`systemctl restart ${unit}`);
+      if (r.code !== 0) {
+        console.warn("[svc-agent] systemctl restart failed; exiting so supervisor can restart.");
+        process.exit(0);
+      }
+      return;
+    }
+    // launchd (if you run under a label)
+    if (isMac) {
+      const label = process.env.LAUNCHD_LABEL;
+      if (label) {
+        await execCmd(`launchctl kickstart -k gui/${process.getuid()}/${label} || launchctl kickstart -k system/${label}`);
+        return;
+      }
+    }
+    // fallback: relaunch process, then exit
+    try {
+      const child = require("child_process").spawn(process.execPath, [process.argv[1]], {
+        detached: true, stdio: "ignore", cwd: process.cwd(), env: process.env,
+      });
+      child.unref();
+    } catch (e) {
+      console.warn("[svc-agent] self relaunch failed:", e.message);
+    }
+    process.exit(0);
+  }
+  
+
 // ---------- System ID (stable, unique per machine) ----------
 const ID_FILE_CANDIDATES = [
   process.env.SVC_AGENT_ID_PATH || "",           // explicit override path
@@ -401,6 +442,25 @@ async function handleMessage(msg) {
       });
       return;
     }
+
+    case "runInstall": {
+        // payload supports: { type:"runInstall", id:"...", args?: string[], restart?: boolean }
+        const args = Array.isArray(data.args) ? data.args : [];
+        const restart = !!data.restart;
+      
+        try {
+          const res = await runLocalInstallSh(args);
+          wsSend({ type: "installResult", id, ok: true, stdout: res.stdout });
+      
+          if (restart) {
+            // give the socket a moment to flush
+            setTimeout(() => { restartSelf(); }, 500);
+          }
+        } catch (e) {
+          wsSend({ type: "installResult", id, ok: false, error: e.message || String(e) });
+        }
+        return;
+      }
 
     default:
       // unknown / ignored

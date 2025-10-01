@@ -2,7 +2,7 @@
 
 # TDS Service Health Agent installer (Linux systemd + macOS launchd)
 # Usage (branch):
-#   curl -fsSL https://raw.githubusercontent.com/thomasdye12/tds-svc-agent/main/scripts/install.sh | bash
+#   curl -fsSl https://raw.githubusercontent.com/thomasdye12/tds-svc-agent/refs/heads/main/scripts/install.sh | bash
 #   (with overrides) OWNER=thomasdye12 REPO=tds-svc-agent BRANCH=main AUTO_NODE=true bash
 #
 # Usage (tagged release zip):
