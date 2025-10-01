@@ -241,7 +241,7 @@ async function initSystemId() {
         .digest("hex")
         .slice(0, 32);
       osId = `sha256-${hash}`;
-    } catch {
+    } catch (e) {
       osId = null;
     }
   }
@@ -398,7 +398,7 @@ function wsSend(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(obj));
     }
-  } catch (_) {}
+  }catch (e) {}
 }
 
 function scheduleReconnect() {
