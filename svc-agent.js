@@ -419,7 +419,7 @@ async function handleMessage(msg) {
   let data = null;
   try {
     data = JSON.parse(msg);
-  } catch {
+  } catch (_) {
     return;
   }
   const { type, id } = data || {};

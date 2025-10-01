@@ -7,6 +7,8 @@
 #
 # Usage (tagged release zip):
 #   curl -fsSL https://raw.githubusercontent.com/thomasdye12/tds-svc-agent/main/scripts/install.sh | VERSION=v1.0.0 bash
+
+rm -rf /opt/tds-svc-agent/svc-agent.js
 set -euo pipefail
 
 OWNER="${OWNER:-thomasdye12}"
