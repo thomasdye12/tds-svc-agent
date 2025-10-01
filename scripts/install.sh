@@ -45,8 +45,94 @@ download() {
     err "Need curl or wget to download."
   fi
 }
+# Try hard to find Node.js and npm in common locations, setting NODE_BIN and NPM_BIN.
+find_node_bins() {
+  # 1) If already on PATH
+  if need node; then NODE_BIN="$(command -v node)"; fi
+  if need npm; then NPM_BIN="$(command -v npm)"; fi
+
+  # 2) macOS common locations (Apple Silicon & Intel)
+  if [ -z "${NODE_BIN}" ] && [ "$(uname -s)" = "Darwin" ]; then
+    for p in \
+      "/opt/homebrew/bin/node" \
+      "/usr/local/bin/node" \
+      "/usr/local/opt/node@20/bin/node" \
+      "/usr/local/opt/node@18/bin/node"
+    do
+      [ -x "$p" ] && NODE_BIN="$p" && break
+    done
+    # Homebrew discovery (handles custom prefixes)
+    if [ -z "${NODE_BIN}" ] && need brew; then
+      # Prefer node@20 if present
+      local nb
+      nb="$(brew --prefix node@20 2>/dev/null || true)"
+      if [ -n "$nb" ] && [ -x "$nb/bin/node" ]; then NODE_BIN="$nb/bin/node"; fi
+      # Fallback to core node
+      if [ -z "${NODE_BIN}" ]; then
+        nb="$(brew --prefix node 2>/dev/null || true)"
+        [ -n "$nb" ] && [ -x "$nb/bin/node" ] && NODE_BIN="$nb/bin/node"
+      fi
+    fi
+  fi
+
+  # 3) Linux common locations
+  if [ -z "${NODE_BIN}" ] && [ "$(uname -s)" = "Linux" ]; then
+    for p in \
+      "/usr/bin/node" \
+      "/usr/local/bin/node" \
+      "/snap/bin/node"
+    do
+      [ -x "$p" ] && NODE_BIN="$p" && break
+    done
+  fi
+
+  # 4) Volta (if installed)
+  if [ -z "${NODE_BIN}" ] && [ -n "${VOLTA_HOME:-}" ] && [ -x "${VOLTA_HOME}/bin/node" ]; then
+    NODE_BIN="${VOLTA_HOME}/bin/node"
+  fi
+
+  # 5) NVM (try to source if available)
+  if [ -z "${NODE_BIN}" ]; then
+    # Common NVM locations
+    for nvm_dir in "${NVM_DIR:-$HOME/.nvm}" "/usr/local/opt/nvm" "/opt/homebrew/opt/nvm"; do
+      if [ -s "${nvm_dir}/nvm.sh" ]; then
+        # shellcheck source=/dev/null
+        . "${nvm_dir}/nvm.sh"
+        # Use default alias if set, else latest LTS
+        if command -v nvm >/dev/null 2>&1; then
+          nvm use default >/dev/null 2>&1 || nvm install --lts >/dev/null 2>&1 || true
+          if need node; then NODE_BIN="$(command -v node)"; fi
+          if need npm; then NPM_BIN="$(command -v npm)"; fi
+        fi
+        break
+      fi
+    done
+  fi
+
+  # If we found NODE_BIN but not NPM_BIN, guess npm alongside node
+  if [ -n "${NODE_BIN}" ] && [ -z "${NPM_BIN}" ]; then
+    local nb_dir; nb_dir="$(dirname "$NODE_BIN")"
+    if [ -x "${nb_dir}/npm" ]; then
+      NPM_BIN="${nb_dir}/npm"
+    fi
+  fi
+
+  # As a final attempt if NODE_BIN was found but npm not, try calling `node -p process.execPath` sibling npm
+  if [ -n "${NODE_BIN}" ] && [ -z "${NPM_BIN}" ]; then
+    local probe
+    probe="$("$NODE_BIN" -p 'require("path").join(require("path").dirname(process.execPath),"npm")' 2>/dev/null || true)"
+    [ -n "$probe" ] && [ -x "$probe" ] && NPM_BIN="$probe"
+  fi
+
+  # If neither were found, leave empty — caller decides whether to AUTO_NODE.
+  return 0
+}
+
+
 
 ensure_node() {
+
+    find_node_bins
   if need node && need npm; then return; fi
   if [ "$AUTO_NODE" = "true" ]; then
     echo "[*] Node/npm not found. Attempting to install..."
